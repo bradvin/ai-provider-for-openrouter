@@ -158,7 +158,8 @@ class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDire
         }
         $legacy = $architecture['modality'] ?? 'text->text';
         $parts = is_string($legacy) ? explode('->', $legacy) : [];
-        $modalities = [];
+        /** @var array{input: list<string>, output: list<string>} $modalities */
+        $modalities = ['input' => [], 'output' => []];
         foreach (['input', 'output'] as $index => $direction) {
             $key = $direction . '_modalities';
             $values = array_key_exists($key, $architecture)

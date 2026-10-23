@@ -28,8 +28,8 @@ Independent QA: GPT-6 Sol Medium. Supervisor owns this plan and Git operations.
 
 | Task | Scope | Developer | QA | Status | Repairs | Evidence | Commit |
 |---|---|---|---|---|---|---|---|
-| T1 | Explicit modality return shape; preserve behavior | Luna High | Sol Medium | pending | 0 | Pending | Pending |
-| T2 | Full baseline, static and WordPress/live validation | Supervisor | Sol Medium reviews T1 and coverage | pending | 0 | Prior head: 203 tests per PHP runtime, 28 WP probes, 8 live passes; PHPStan one error | Pending |
+| T1 | Explicit modality return shape; preserve behavior | Luna High (`modality_fix`) | Sol Medium (`independent_qa`) | validating | 0 | Independent QA PASS; 203/203 on PHP 8.4.6 and 7.4.30; PHPStan max clean | Awaiting validated commit |
+| T2 | Full baseline, static and WordPress/live validation | Supervisor | Sol Medium reviews T1 and coverage | validating | 0 | 203/203 per PHP runtime; 28 WP cases; 8/8 live; syntax/PSR-12/PHPStan pass | Awaiting validated commit |
 
 T2 depends on the frozen T1 implementation. No parallel implementation edits.
 Workers may not edit this tracker, commit, push, or delegate further.
@@ -74,3 +74,31 @@ previous `/models` snapshot. No live completeness claim covers those paths.
   Fork is `origin`; upstream push URL is disabled locally.
 - Next: T1 implementation, independent QA, full validation, scoped commits,
   then push only the authorized fork branch.
+
+## Validation results — 2026-10-23
+
+- Production diff: initialize `getModalities()` with both directional keys and
+  document its exact array shape. Existing normalization overwrites both keys;
+  no behavior change, ignored errors, baseline growth, or dependency update.
+- Independent QA: PASS. SDK 0.4.3 suites: 14 supported-option, 43 text, 146 image
+  cases on each of PHP 8.4.6 and actual PHP 7.4.30; all exit 0.
+- PHPStan 2.1.32 level max: no errors with 256 MB, exit 0. Developer's initial
+  run omitted the memory flag and exhausted 128 MB; explicit-limit reruns pass.
+- Source PSR-12 (PHPCS 3.13.5), syntax on six PHP runtime files, and diff checks pass.
+- Disposable WordPress 7.1.3 / Core SDK 1.3.1: 28 independent offline cases pass,
+  including zero generation requests for unsupported options/media.
+- Eight renewed authenticated calls all pass, no retries. Five use
+  `openai/gpt-4.1-mini` (text, tools, JSON, schema, combined); three use
+  `google/gemini-2.5-flash-image` (ordinary text, image generation, reference edit).
+  Actual reported cost totals US$0.0776865, below US$1.
+- Both image results fully decode using GD. Visual inspection confirms red
+  square generation and a blue-square edit on white. Response IDs, byte/order
+  preservation, usage mapping, system/history/reference preservation pass.
+- OpenStation-specific execution and live image-only-model variant remain
+  unverified; this follow-up does not invent evidence for unavailable paths.
+- No remote result URLs or absent usage were observed live; corresponding
+  rejection/sentinel contracts remain covered by offline tests.
+
+Full repository deployment/Props Bot workflows were not run; root development
+Composer/default PHPCS debt remains unchanged. The complete available contract
+suite and the explicit integration matrix above were rerun after the source fix.
