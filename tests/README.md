@@ -19,10 +19,8 @@ Composer warns that the copied lock hash differs from the reduced manifest; the 
 are deliberately retained. No dependency update is performed. The bootstrap refuses an existing
 directory, runs no external commands, and never deletes anything. Keep the printed path for replay.
 
-The supported-options runner (14 cases) evolves PR #3 head
-1386a995a8892dcf688e7047601d87ced9808562, authored by foo-bender
-<bender@fooplugins.com>. Parameter intent originated with Brad Vincent
-<bradvin@gmail.com> at 0e0d2797e9281260aa2a3fc7acc88e1c368dfd09;
+The supported-options runner (15 cases) evolves PR #3 head
+1386a995a8892dcf688e7047601d87ced9808562, authored by @foo-bender. Parameter intent originated with @bradvin at 0e0d2797e9281260aa2a3fc7acc88e1c368dfd09;
 baseline fix at 6caee1b3e05a013197809ae5468cb5c719f0e1a8 and topK fix at the
 head above. Only those tests and specific option/helper additions are reused,
 not competing whole metadata files or older configs/docs.
@@ -41,8 +39,8 @@ Runtime policy:
 - Keep additive text baseline, including plain text MIME, even without advanced metadata.
 - Only tools evidence enables declarations. response_format OR structured_outputs enables
   JSON mode; structured_outputs specifically enables schemas. Typed topK is not encoded.
-- Raw JSON schemas are wrapped as name=response/schema/strict=true. SDK name/schema
-  envelopes retain their name, description and explicit strict=false. Incompatible explicit
+- Raw JSON schemas are wrapped as name=response/schema without forcing strict mode. SDK
+  envelopes retain their name, description and explicit strict=true or strict=false. Incompatible explicit
   MIME, malformed envelopes, contradictory provider.require_parameters and custom contract
   collisions fail locally. Schema requests preserve provider preferences and enforce
   require_parameters=true. No schema-dropping retries. Ordinary text calls on dual models
@@ -51,26 +49,30 @@ Runtime policy:
   Architecture input/output arrays take precedence over legacy modality; each direction is
   normalized separately. Image-capable models additionally advertise separate [image]
   output for the implemented image route, never mixed [text,image]. PDF, video, audio
-  and streaming are not advertised.
+  and streaming are not advertised. Directly supplied text models retain the parent
+  SDK's candidate-count and supported file serialization; advanced tools/schema/JSON
+  guards still apply. Custom text-only modalities and stream=false are accepted,
+  while image-output modalities and active streaming are rejected before transport.
+  Historical baseline sampling options remain for backward compatibility.
 
 PR #8 head faf076cedaf737d974395eeeadb5dff0b3484382 (Copilot,
-verified commit identity copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>)
+verified commit identity @copilot-swe-agent[bot])
 provides the text-only multimodal intent. PR #9 head
-adcb8014ee91578a29962b5f89009f1a5cee3a95 by Roberto Aranda
-<roberto.aranda@automattic.com> provides tool/structured-output discovery intent.
+adcb8014ee91578a29962b5f89009f1a5cee3a95 by @epeicher provides tool/structured-output discovery intent.
 Their whole metadata implementations are not copied; the integration uses one normalized
 owner, separates tools/JSON/schema evidence, and advertises only implemented media forms.
 PR #7 image intent is implemented in the separate image slice described below.
-Issue #11 and Roberto's comment 6043724842 are the policy authority; maintainer approval
-has not been received. No production/live OpenRouter/WordPress acceptance is claimed.
+Issue #11 and subsequent maintainer review on PR #12 record the capability policy.
+These fixtures are offline contracts; authenticated acceptance is recorded separately
+on PR #12 and applies only to the tested revision.
 
 The tests execute the provider parser, real SDK requirement selection and inherited serializer.
 They prove no typed topK is selectable when the SDK omits top_k, preserving other option mappings.
 
 ## Image contract gate
 
-The runner also executes 146 image contracts (203 tests total: 14 options, 43 text,
-146 image). Real SDK registry/PromptBuilder `generateImageResult()` performs normal
+The runner also executes 166 image contracts (230 tests total: 15 options, 49 text,
+166 image). Real SDK registry/PromptBuilder `generateImageResult()` performs normal
 image-only requirement selection and interface dispatch. Synthetic dual-output,
 image-only, text-only and malformed metadata fixtures and a strict mock transport
 exercise requests and results. No generated/input URL or local path is retrieved.
@@ -87,7 +89,7 @@ exercise requests and results. No generated/input URL or local path is retrieved
   may themselves read caller-supplied local files; this adapter adds no path or
   URL resolution from generated responses.
 - Image calls accept systemInstruction, image-only outputModalities, and bounded
-  customOptions (`user`; provider `only/order/ignore`, `allow_fallbacks`, simple
+  customOptions (`image_config` with a validated aspect ratio; `user`; provider `only/order/ignore`, `allow_fallbacks`, simple
   `sort`). Every other configured SDK field is rejected locally, even explicit
   candidateCount=1: count, MIME/file type, size/aspect/orientation, sampling,
   tools/schema and streaming are not silently ignored or coerced. Custom options
@@ -96,23 +98,24 @@ exercise requests and results. No generated/input URL or local path is retrieved
   claim that those options work on image calls.
 - Results parse `choices[].message.images[].image_url.url` and retain candidate/
   image order, optional response text, result ID and response model in additional
-  data. Supported declared result MIME is PNG/JPEG/WebP/GIF/SVG (MIME casing is
+  data. Supported declared result MIME is PNG/JPEG/WebP/GIF (MIME casing is
   normalized). Canonical nonempty base64 is validated before SDK File construction;
-  these are MIME declarations, not a guarantee of decoded raster/SVG validity.
+  these are MIME declarations, not a guarantee of decoded raster validity.
   Remote result URLs are rejected because their MIME is unknown, never guessed
   from a `.png` extension or fetched. Empty, malformed or unsupported responses
   and streaming fail with controlled errors rather than successful empty results.
 - Usage maps prompt_tokens to prompt/input, completion_tokens to completion/output,
   and total_tokens to total. SDK 0.4.3 requires integers and has no nullable count:
-  absent/null counts use the explicit provider-specific sentinel -1, NOT zero or
-  an inferred total. Consumers must treat -1 as unknown, not billable tokens.
+  absent/null counts use a zero compatibility placeholder, never an inferred total.
+  Consumers must use the unknown-name list to distinguish missing counts from measured zero.
+  A placeholder is not proof of zero cost and must not be used to infer billing.
   Original optional/nested usage is retained in additionalData.openrouter_usage;
   additionalData.openrouter_unknown_token_counts names unknown fields. This is
   not a universal SDK unknown-count convention or proven billing compatibility.
 
 PR #7 provenance: head 826b0c8c94a10e771ea1592fc4f379ab7fe948f1; authored by
-copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>, with verified
-trailers crediting jonathanbossenger <180629+jonathanbossenger@users.noreply.github.com>
+@copilot-swe-agent[bot], with verified
+trailers crediting @jonathanbossenger
 in commits 3df7074ee2bacc5ff323363465bfc9b5aab21c74,
 293c4eabcab8ba487b9e44c13c0b5b0b860ad822 and the head above. Its routing/editing
 intent is retained; endpoint, exact modality sets, MIME/usage and parser naming
@@ -125,6 +128,18 @@ https://openrouter.ai/docs/guides/overview/multimodal/image-generation.
 Tests/bootstrap are development-only: /tests is excluded by .distignore from the
 WordPress release filter and by .gitattributes export-ignore from source/Composer
 archives. Run these commands from a Git checkout, not a release/source archive.
-Static PHP 7.4 compatibility and the pinned SDK's array_is_list/str_contains
-polyfills are checked; actual execution on PHP 7.4 and authenticated image/editing
-WordPress/OpenStation acceptance remain outstanding. No live readiness is claimed.
+The suite also runs on actual PHP 7.4.30. Current authenticated WordPress and
+image/editing evidence is recorded on PR #12 for the exact tested revision. These
+fixtures do not prove live inference or actual OpenStation application integration.
+
+## Image response tolerance
+
+Optional `tool_calls`, `function_call`, `audio`, and `video` fields may be absent,
+null, or exactly [] (no payload). Other values are rejected. Missing/null
+`finish_reason` maps to stop after valid image parsing; explicit error or unsupported
+reasons still fail. SVG results are rejected before File construction. Declared
+raster MIME/base64 validation does not replace pixel decoding in a consumer.
+
+Metadata uses a parser-revision cache suffix so an update does not reuse records
+from the previous capability parser. Serialized enum values are compared by their
+predicates/values, rather than relying on singleton object identity.

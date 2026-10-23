@@ -8,10 +8,29 @@ declare(strict_types=1);
 
 namespace WordPress\OpenRouterAiProvider\Tests;
 
+use ReflectionProperty;
+use WordPress\AiClient\AiClient;
+use WordPress\AiClient\Providers\ApiBasedImplementation\AbstractApiBasedModelMetadataDirectory;
 use WordPress\AiClient\Providers\Models\DTO\ModelConfig;
 use WordPress\AiClient\Providers\Models\DTO\ModelMetadata;
 
 require __DIR__ . '/harness.php';
+
+class CacheRevisionDirectoryForTest extends MetadataDirectoryForTest
+{
+    public int $fetchCount = 0;
+
+    protected function sendListModelsRequest(): array
+    {
+        $this->fetchCount++;
+        return ['fresh/model' => $this->parseFixture(['id' => 'fresh/model'])];
+    }
+
+    public function cacheNamespace(): string
+    {
+        return $this->getBaseCacheKey();
+    }
+}
 
 function expectOptions(ModelMetadata $metadata, array $extra = []): void
 {
@@ -29,6 +48,21 @@ function expectOptions(ModelMetadata $metadata, array $extra = []): void
 }
 
 $tests = [
+    'metadata schema revision bypasses the old SDK cache key' => static function (): void {
+        $directory = new CacheRevisionDirectoryForTest();
+        $oldBase = 'ai_client_' . AiClient::VERSION . '_' . md5(CacheRevisionDirectoryForTest::class);
+        expectSame($oldBase . '_openrouter_schema_v2', $directory->cacheNamespace(), 'Schema revision namespace');
+        $property = new ReflectionProperty(AbstractApiBasedModelMetadataDirectory::class, 'localCache');
+        $property->setAccessible(true);
+        $property->setValue($directory, [
+            $oldBase . '_models' => ['stale/model' => $directory->parseFixture(['id' => 'stale/model'])],
+        ]);
+        $models = $directory->listModelMetadata();
+        expectSame(1, $directory->fetchCount, 'Old key cannot satisfy the new schema lookup');
+        expectSame('fresh/model', $models[0]->getId(), 'Fresh model metadata returned');
+        $directory->listModelMetadata();
+        expectSame(1, $directory->fetchCount, 'New schema key caches the fetched map');
+    },
     'topK is rejected even when the API lists top_k' => static function (): void {
         $metadata = metadata(['supported_parameters' => ['top_k']]);
         $config = new ModelConfig();

@@ -14,6 +14,9 @@ use WordPress\AiClient\Providers\Http\DTO\Response;
 use WordPress\AiClient\Providers\Http\Enums\HttpMethodEnum;
 use WordPress\AiClient\Providers\Http\Exception\ResponseException;
 use WordPress\AiClient\Providers\Models\DTO\ModelRequirements;
+use WordPress\AiClient\Providers\Models\DTO\ModelMetadata;
+use WordPress\AiClient\Providers\Models\DTO\ModelConfig;
+use WordPress\AiClient\Providers\Models\DTO\SupportedOption;
 use WordPress\AiClient\Providers\Models\Enums\CapabilityEnum;
 use WordPress\AiClient\Providers\Models\ImageGeneration\Contracts\ImageGenerationModelInterface;
 use WordPress\AiClient\Results\DTO\Candidate;
@@ -29,23 +32,27 @@ use WordPress\AiClient\Results\Enums\FinishReasonEnum;
  * Only text and text+image prompts and image-only SDK output are implemented;
  * the wire request may also ask a dual model for accompanying text.
  *
- * @since 1.0.0
+ * @since 1.1.0
  */
 class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel implements ImageGenerationModelInterface
 {
     /** Supported declared image MIME types, not a claim of decoded image validity. */
-    private const IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml'];
+    private const IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
-    /** Documented Chat Completions input formats are narrower than result MIME support. */
+    /** Documented Chat Completions input image formats. */
     private const INPUT_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
-    /** SDK 0.4.3 requires integer token counts and cannot represent unknown/null. */
-    public const UNKNOWN_TOKEN_COUNT = -1;
+    /**
+     * SDK 0.4.3 requires integer token counts; absent counts use a compatibility placeholder.
+     *
+     * @since 1.1.0
+     */
+    public const MISSING_TOKEN_COUNT_PLACEHOLDER = 0;
 
     /**
      * {@inheritDoc}
      *
-     * @since 1.0.0
+     * @since 1.1.0
      */
     public function generateImageResult(array $prompt): GenerativeAiResult
     {
@@ -64,6 +71,8 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
      * Metadata options are shared across capabilities, so dual models need this
      * image-specific guard even when the SDK's metadata selection succeeds.
      *
+     * @since 1.1.0
+     *
      * @param list<Message> $prompt Prompt messages.
      * @return array<string, mixed> Request parameters.
      */
@@ -76,11 +85,19 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
             }
         }
         $output = $config->getOutputModalities();
-        if ($output !== null && $output !== [ModalityEnum::image()]) {
+        if ($output !== null && (!array_is_list($output) || count($output) !== 1 || !$output[0]->isImage())) {
             throw new InvalidArgumentException('The image route supports only image output, not mixed output.');
         }
-        $requirements = ModelRequirements::fromPromptData(CapabilityEnum::imageGeneration(), $prompt, $config);
-        if (!$requirements->areMetBy($this->metadata())) {
+        $requirementsConfig = ModelConfig::fromArray($config->toArray());
+        if ($output !== null) {
+            $requirementsConfig->setOutputModalities([ModalityEnum::image()]);
+        }
+        $requirements = ModelRequirements::fromPromptData(
+            CapabilityEnum::imageGeneration(),
+            $prompt,
+            $requirementsConfig
+        );
+        if (!$requirements->areMetBy($this->metadataWithCanonicalModalities())) {
             throw new InvalidArgumentException(
                 'Selected OpenRouter model does not support the requested image contract.'
             );
@@ -89,7 +106,13 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
         $custom = $this->validateImageCustomOptions($config->getCustomOptions());
         // Use capabilities from the canonical metadata owner, not a second API
         // modality interpretation. Image-only models must send only [image].
-        $dual = in_array(CapabilityEnum::textGeneration(), $this->metadata()->getSupportedCapabilities(), true);
+        $dual = false;
+        foreach ($this->metadata()->getSupportedCapabilities() as $capability) {
+            if ($capability->isTextGeneration()) {
+                $dual = true;
+                break;
+            }
+        }
         // Prepend the system ourselves: the SDK drops an explicitly empty string.
         $messages = $this->prepareMessagesParam($prompt);
         if ($config->getSystemInstruction() !== null) {
@@ -106,9 +129,55 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
     }
 
     /**
+     * SDK 0.4.3 compares supported modality objects by identity. Serialized
+     * metadata detaches them from its enum cache, so rehydrate only the
+     * modality sets before passing metadata to ModelRequirements.
+     *
+     * @since 1.1.0
+     *
+     * @return ModelMetadata Metadata with canonical modality enum instances.
+     */
+    private function metadataWithCanonicalModalities(): ModelMetadata
+    {
+        $metadata = $this->metadata();
+        $options = [];
+        foreach ($metadata->getSupportedOptions() as $option) {
+            $values = $option->getSupportedValues();
+            if (
+                $values !== null && ($option->getName()->isInputModalities()
+                || $option->getName()->isOutputModalities())
+            ) {
+                $canonicalSets = [];
+                foreach ($values as $set) {
+                    if (!is_array($set)) {
+                        $canonicalSets[] = $set;
+                        continue;
+                    }
+                    $canonicalSet = [];
+                    foreach ($set as $modality) {
+                        $canonicalSet[] = $modality instanceof ModalityEnum
+                            ? ModalityEnum::from($modality->value) : $modality;
+                    }
+                    $canonicalSets[] = $canonicalSet;
+                }
+                $values = $canonicalSets;
+            }
+            $options[] = new SupportedOption($option->getName(), $values);
+        }
+        return new ModelMetadata(
+            $metadata->getId(),
+            $metadata->getName(),
+            $metadata->getSupportedCapabilities(),
+            $options
+        );
+    }
+
+    /**
      * No skipped thought/tool/media parts and no local URL retrieval.
      * File DTOs are already constructed by the caller; we never construct an
      * input File from an untrusted path or download a remote File here.
+     *
+     * @since 1.1.0
      *
      * @param list<Message> $prompt Prompt messages.
      */
@@ -160,8 +229,10 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
 
     /**
      * Bounded allowlist prevents custom/nested options bypassing typed contracts.
-     * Only user identification and simple endpoint routing are implemented here;
-     * provider-specific passthrough, image config, media, and tools are rejected.
+     * User identification, simple endpoint routing, and documented aspect ratio
+     * are implemented here; all other provider-specific image options are rejected.
+     *
+     * @since 1.1.0
      *
      * @param array<string, mixed> $custom Custom options.
      * @return array<string, mixed> Validated options, unchanged.
@@ -170,6 +241,19 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
     {
         foreach ($custom as $key => $value) {
             if ($key === 'user' && is_string($value) && $value !== '') {
+                continue;
+            }
+            if ($key === 'image_config') {
+                if (
+                    !is_array($value) || array_keys($value) !== ['aspect_ratio']
+                    || !is_string($value['aspect_ratio'])
+                    || !in_array($value['aspect_ratio'], [
+                        'auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3',
+                        '4:5', '5:4', '21:9',
+                    ], true)
+                ) {
+                    throw new InvalidArgumentException('Unsupported image_config; expected a documented aspect_ratio.');
+                }
                 continue;
             }
             if ($key !== 'provider' || !is_array($value) || array_is_list($value)) {
@@ -205,6 +289,8 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
      * SDK's fallback to filesystem probes for malformed data URIs/plain base64.
      * MIME casing is canonicalized; bytes are never changed or transcoded.
      *
+     * @since 1.1.0
+     *
      * @param string $uri Image data URI.
      * @return array{mime: string, base64: string} Validated inline data.
      */
@@ -228,6 +314,8 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
     /**
      * Parse actual Chat Completions choices[].message.images[], not /images data.
      * All errors use ResponseException and never return a successful empty image.
+     *
+     * @since 1.1.0
      *
      * @param Response $response HTTP response.
      * @return GenerativeAiResult Parsed images and accompanying text.
@@ -265,14 +353,14 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
             if ($value !== null && (!is_int($value) || $value < 0)) {
                 throw $this->invalidImageResponse('usage.' . $key, 'Expected a nonnegative integer or absent count.');
             }
-            $counts[] = $value ?? self::UNKNOWN_TOKEN_COUNT;
+            $counts[] = $value ?? self::MISSING_TOKEN_COUNT_PLACEHOLDER;
             if ($value === null) {
                 $unknown[] = $key;
             }
         }
         // The pinned SDK cannot express missing counts or nested usage. Do not
-        // fabricate zeros or sum nested counters; expose explicit -1 unknowns
-        // and retain the original usage and unknown fields in additionalData.
+        // infer token counts from nested counters. The zero placeholder is not
+        // billable usage: preserve raw usage and unknown field names separately.
         $additional = $data;
         unset($additional['id'], $additional['choices'], $additional['usage']);
         $additional['openrouter_usage'] = $usage;
@@ -290,6 +378,8 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
     /**
      * Preserve candidate and image order. Remote result URLs have no trustworthy
      * MIME: reject explicitly instead of guessing PNG or retrieving the URL.
+     *
+     * @since 1.1.0
      *
      * @param mixed $choice Raw choice.
      * @param int $index Choice index.
@@ -348,7 +438,7 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
             $parts[] = new MessagePart($file);
         }
         $finish = $choice['finish_reason'] ?? null;
-        if ($finish === 'stop') {
+        if ($finish === null || $finish === 'stop') {
             $reason = FinishReasonEnum::stop();
         } elseif ($finish === 'length') {
             $reason = FinishReasonEnum::length();
@@ -361,6 +451,8 @@ class OpenRouterImageGenerationModel extends OpenRouterTextGenerationModel imple
     }
 
     /**
+     * @since 1.1.0
+     *
      * @param string $path Invalid response field (never the untrusted URL/data).
      * @param string $reason Safe explanatory message.
      * @return ResponseException Controlled API response exception.

@@ -52,6 +52,74 @@ use WordPress\OpenRouterAiProvider\Provider\OpenRouterProvider;
 class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDirectory
 {
     /**
+     * Restore SDK enum singletons after a persistent cache unserializes models.
+     * SDK 0.4.3 compares nested modality values by object identity during
+     * discovery, so cloned enum objects cannot satisfy prompt requirements.
+     *
+     * @since 1.1.0
+     *
+     * @param string $key Cache key suffix.
+     * @param mixed  $default Value returned for an absent key.
+     * @return mixed Cached value with canonical model enum instances.
+     */
+    protected function getCache(string $key, $default = null)
+    {
+        $value = parent::getCache($key, $default);
+        if ($key !== 'models' || !is_array($value)) {
+            return $value;
+        }
+        foreach ($value as $id => $metadata) {
+            if (!$metadata instanceof ModelMetadata) {
+                continue;
+            }
+            $options = [];
+            foreach ($metadata->getSupportedOptions() as $option) {
+                $name = OptionEnum::from($option->getName()->value);
+                $supportedValues = $option->getSupportedValues();
+                if ($name->isInputModalities() || $name->isOutputModalities()) {
+                    if (is_array($supportedValues)) {
+                        $normalizedSets = [];
+                        foreach ($supportedValues as $set) {
+                            if (!is_array($set)) {
+                                $normalizedSets[] = $set;
+                                continue;
+                            }
+                            $normalizedSet = [];
+                            foreach ($set as $modality) {
+                                $normalizedSet[] = $modality instanceof ModalityEnum
+                                    ? ModalityEnum::from($modality->value)
+                                    : $modality;
+                            }
+                            $normalizedSets[] = $normalizedSet;
+                        }
+                        $supportedValues = $normalizedSets;
+                    }
+                }
+                $options[] = new SupportedOption($name, $supportedValues);
+            }
+            $capabilities = [];
+            foreach ($metadata->getSupportedCapabilities() as $capability) {
+                $capabilities[] = CapabilityEnum::from($capability->value);
+            }
+            $value[$id] = new ModelMetadata($metadata->getId(), $metadata->getName(), $capabilities, $options);
+        }
+        return $value;
+    }
+
+    /**
+     * Separate this directory's current option/modality shape from previously
+     * cached SDK 0.4.3 model metadata.
+     *
+     * @since 1.1.0
+     *
+     * @return string Cache namespace for this metadata schema.
+     */
+    protected function getBaseCacheKey(): string
+    {
+        return parent::getBaseCacheKey() . '_openrouter_schema_v2';
+    }
+
+    /**
      * {@inheritDoc}
      *
      * @since 1.0.0
@@ -145,7 +213,9 @@ class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDire
     /**
      * One normalized input/output interpretation, preferring explicit arrays.
      * Missing legacy architecture retains the text baseline; malformed explicit
-     * metadata invents no modality. Both routes share this canonical owner.
+     * metadata adds no modality. Text and image routes use these same values.
+     *
+     * @since 1.1.0
      *
      * @param array<string, mixed> $model Model data.
      * @return array{input: list<string>, output: list<string>}
@@ -173,6 +243,8 @@ class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDire
     /**
      * Advertise only implemented routes with a text-bearing prompt.
      *
+     * @since 1.1.0
+     *
      * @param array{input: list<string>, output: list<string>} $modalities Modalities.
      * @return list<CapabilityEnum> Supported capabilities.
      */
@@ -197,12 +269,17 @@ class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDire
     /**
      * Serialized options and exact modality sets for text and image routes.
      *
+     * @since 1.1.0
+     *
      * @param array<string, mixed> $model Model data.
      * @param array{input: list<string>, output: list<string>} $modalities Modalities.
      * @return list<SupportedOption> Supported options.
      */
     protected function determineSupportedOptions(array $model, array $modalities): array
     {
+        // These six options were always advertised by the 1.0.0 directory,
+        // including when supported_parameters was partial or missing. Keep
+        // their discovery behavior for existing PromptBuilder integrations.
         $supportedOptions = [
             new SupportedOption(OptionEnum::systemInstruction()),
             new SupportedOption(OptionEnum::maxTokens()),
@@ -273,6 +350,8 @@ class OpenRouterModelMetadataDirectory extends AbstractApiBasedModelMetadataDire
     }
 
     /**
+     * @since 1.1.0
+     *
      * @param mixed $values Untrusted API metadata.
      * @return list<string> Normalized, nonempty, distinct string values.
      */

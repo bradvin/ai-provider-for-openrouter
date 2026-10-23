@@ -64,35 +64,60 @@ echo $result->toText();
 
 Available models are dynamically discovered from the OpenRouter API. This includes hundreds of models from providers like OpenAI, Anthropic, Google, Meta, Mistral, and many more. See the [OpenRouter documentation](https://openrouter.ai/models) for the full list of available models.
 
+## JSON responses
+
+JSON mode and schema responses are separate capabilities. `asJsonResponse($schema)`
+sends a JSON schema to compatible models. The adapter preserves an explicitly
+provided `strict` flag and otherwise lets the provider choose its default. Use
+an SDK schema envelope with `strict => true` when you need strict enforcement;
+your schema must meet that provider's strict-schema requirements. Omitting `strict`
+does not guarantee support for every ordinary JSON schema: a provider may still
+reject optional fields or other schema features. The adapter preserves your schema
+and reports that error without rewriting it or retrying in a weaker mode.
+
+## Compatibility notes
+
+Normal model discovery advertises implemented text and text-plus-image inputs;
+it does not claim PDF, audio, video or streaming support. Explicitly supplied
+text models retain the parent SDK's candidate-count and file serialization
+behavior. Whether a particular endpoint accepts those inputs remains its own
+contract. Existing baseline sampling options remain listed for backward
+compatibility; check the selected model's current metadata before using them.
+
+Custom text options may not replace the selected model, prompt or an explicit
+tools/schema contract. Text-only `modalities` and `stream => false` are accepted.
+Image-output modalities and active streaming remain rejected on the text route
+because its result parser cannot preserve those results. Use the image builder
+for generated images.
+
 ## Image generation and editing
 
-The normal SDK `generateImageResult()` operation selects compatible discovered
-image-output models. Image-only and dual text/image models use OpenRouter Chat
-Completions; ordinary text/tools/schema operations on dual models stay unchanged.
-Prompts support text and, where model metadata allows, reference image files.
-This adapter does not implement the separate dedicated Image API.
+Use the normal SDK `generateImageResult()` builder with a compatible image-output
+model, a text prompt, and optional reference images. Generation and editing use
+OpenRouter Chat Completions. Accompanying text is preserved. Ordinary text calls
+on dual-capability models continue to request text.
 
-Image calls reject unsupported options locally, including explicit output count,
-size/aspect/orientation, MIME/file type, tools/schema, sampling and streaming.
-Only system instructions, image-only output requirements, and bounded user/provider
-routing custom options are supported. Generated results require valid inline image
-data URIs; remote result URLs are rejected rather than fetched or assigned a guessed
-MIME. Accompanying text and image/candidate order are retained.
+To request an image aspect ratio, pass an `image_config` custom option:
 
-For image responses, optional `tool_calls`, `function_call`, `audio`, and `video`
-fields may be absent, `null`, or exactly `[]` (no payload). Every other value,
-including falsy scalars (`0`, `false`, `''`) and nonempty arrays/objects, is rejected.
-This placeholder tolerance does not add tool execution or audio/video output support.
+```php
+$config = new \WordPress\AiClient\Providers\Models\DTO\ModelConfig();
+$config->setCustomOptions(['image_config' => ['aspect_ratio' => '16:9']]);
+$result = AiClient::prompt('A red square on a white background')
+    ->usingProvider('openrouter')
+    ->usingModelConfig($config)
+    ->generateImageResult();
+```
 
-For image usage, prompt/completion/total token counts remain distinct. SDK 0.4.3
-cannot express null counts: missing counts use this provider's explicit -1 unknown
-sentinel, never fabricated zero. Do not sum or bill unknown counts. Original usage
-is retained in result additional data under `openrouter_usage`, with missing names
-in `openrouter_unknown_token_counts`. This is not a universal SDK convention.
+Typed image count, file type, size/orientation, sampling, tools/schema and
+streaming options are not implemented and fail locally. Generated results must
+contain inline PNG, JPEG, WebP or GIF data; remote URLs and SVG are rejected.
+For missing image token counts, the SDK receives a zero compatibility placeholder;
+`openrouter_unknown_token_counts` identifies unknown counts and `openrouter_usage`
+preserves the original usage. Zero placeholders are not measured usage or proof
+that a request was free.
 
-See [the offline contract tests](tests/README.md) in a Git checkout for exact supported
-forms, limitations, provenance and replay commands. Live OpenRouter/WordPress
-acceptance and actual PHP 7.4 runtime verification are not claimed by offline tests.
+See [the contract-test documentation](tests/README.md) for configuration rules,
+compatibility limits and replay commands.
 
 ## Configuration
 

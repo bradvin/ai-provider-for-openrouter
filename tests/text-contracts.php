@@ -6,6 +6,8 @@ declare(strict_types=1);
 namespace WordPress\OpenRouterAiProvider\Tests;
 
 use RuntimeException;
+use Psr\SimpleCache\CacheInterface;
+use WordPress\AiClient\AiClient;
 use WordPress\AiClient\Builders\PromptBuilder;
 use WordPress\AiClient\Files\DTO\File;
 use WordPress\AiClient\Messages\DTO\Message;
@@ -50,6 +52,81 @@ class FixtureTransport implements HttpTransporterInterface
     }
 }
 
+class SerializedFixtureCache implements CacheInterface
+{
+    private array $values = [];
+
+    public function get($key, $default = null)
+    {
+        return isset($this->values[$key]) ? unserialize($this->values[$key]) : $default;
+    }
+
+    public function set($key, $value, $ttl = null)
+    {
+        $this->values[$key] = serialize($value);
+        return true;
+    }
+
+    public function delete($key)
+    {
+        unset($this->values[$key]);
+        return true;
+    }
+
+    public function clear()
+    {
+        $this->values = [];
+        return true;
+    }
+
+    public function getMultiple($keys, $default = null)
+    {
+        $values = [];
+        foreach ($keys as $key) { $values[$key] = $this->get($key, $default); }
+        return $values;
+    }
+
+    public function setMultiple($values, $ttl = null)
+    {
+        foreach ($values as $key => $value) { $this->set($key, $value, $ttl); }
+        return true;
+    }
+
+    public function deleteMultiple($keys)
+    {
+        foreach ($keys as $key) { $this->delete($key); }
+        return true;
+    }
+
+    public function has($key)
+    {
+        return isset($this->values[$key]);
+    }
+}
+
+class SerializedCacheFixtureTransport extends FixtureTransport
+{
+    public int $modelsRequests = 0;
+
+    public function send(Request $request, ?RequestOptions $options = null): Response
+    {
+        if ($request->getUri() === OpenRouterProvider::url('/models')) {
+            $this->modelsRequests++;
+            return new Response(200, ['Content-Type' => 'application/json'], json_encode(fixture('image-models')));
+        }
+        $this->requests[] = $request;
+        $data = $request->getData();
+        if (in_array('image', $data['modalities'] ?? [], true)) {
+            $response = fixture('image-response');
+            $response['choices'][0]['message']['images'][1]['image_url']['url'] =
+                $response['choices'][0]['message']['images'][0]['image_url']['url'];
+        } else {
+            $response = fixture('text-response');
+        }
+        return new Response(200, ['Content-Type' => 'application/json'], json_encode($response));
+    }
+}
+
 function registry(FixtureTransport $transport): ProviderRegistry
 {
     $registry = new ProviderRegistry();
@@ -83,12 +160,12 @@ function declaration(): FunctionDeclaration
     ]);
 }
 
-function assertSchemaPayload(array $payload, bool $strict = true, string $name = 'response'): void
+function assertSchemaPayload(array $payload, ?bool $strict = null, string $name = 'response'): void
 {
     expectSame('json_schema', $payload['response_format']['type'] ?? null, 'Schema type');
-    expectSame([
-        'name' => $name, 'schema' => fixture('schema'), 'strict' => $strict,
-    ], $payload['response_format']['json_schema'] ?? null, 'Complete schema envelope');
+    $expected = ['name' => $name, 'schema' => fixture('schema')];
+    if ($strict !== null) { $expected['strict'] = $strict; }
+    expectSame($expected, $payload['response_format']['json_schema'] ?? null, 'Complete schema envelope');
     expectSame(true, $payload['provider']['require_parameters'] ?? null, 'Endpoint support requirement');
 }
 
@@ -103,6 +180,35 @@ function rejectBeforeTransport(array $extra, ModelConfig $config, string $reason
 }
 
 $tests = [
+    'serialized metadata cache keeps normal registry text image and combined payloads selectable' => static function (): void {
+        $previousCache = AiClient::getCache();
+        AiClient::setCache(new SerializedFixtureCache());
+        try {
+            $transport = new SerializedCacheFixtureTransport();
+            $registry = registry($transport);
+            (new PromptBuilder($registry, 'warm cache'))->usingProvider('openrouter')
+                ->usingModelPreference('fixture/text')->generateTextResult();
+            expectSame(1, $transport->modelsRequests, 'One model discovery request warms the cache');
+
+            (new PromptBuilder($registry, 'JSON please'))->usingProvider('openrouter')
+                ->usingModelPreference('fixture/text')->asJsonResponse(fixture('schema'))->generateTextResult();
+            expectSame('json_schema', $transport->requests[1]->getData()['response_format']['type'], 'Text schema payload after cache read');
+
+            (new PromptBuilder($registry, 'draw a tree'))->usingProvider('openrouter')
+                ->usingModelPreference('fixture/dual')->generateImageResult();
+            expectSame(['text', 'image'], $transport->requests[2]->getData()['modalities'], 'Image route selected after cache read');
+
+            (new PromptBuilder($registry, 'answer'))->usingProvider('openrouter')
+                ->usingModelPreference('fixture/dual')->usingFunctionDeclarations(declaration())
+                ->asJsonResponse(fixture('schema'))->generateTextResult();
+            $combined = $transport->requests[3]->getData();
+            expectSame('lookup', $combined['tools'][0]['function']['name'], 'Combined tools survive cache read');
+            expectSame('json_schema', $combined['response_format']['type'], 'Combined schema survives cache read');
+            expectSame(1, $transport->modelsRequests, 'Persistent cache avoids another models request');
+        } finally {
+            AiClient::setCache($previousCache);
+        }
+    },
     'Roberto combined as_json_response equivalent selects vision model and sends full contract' => static function (): void {
         $transport = new FixtureTransport();
         $builder = (new PromptBuilder(registry($transport), 'hello'))
@@ -154,12 +260,28 @@ $tests = [
         $config->setOutputSchema(fixture('schema'));
         assertSchemaPayload(requestParams(metadata(['supported_parameters' => ['structured_outputs']]), $config));
     },
-    'envelope default strict and explicit false retain caller name and schema' => static function (): void {
+    'omitted and explicit strict values retain caller name and schema' => static function (): void {
         foreach ([null, false, true] as $strict) {
             $envelope = ['name' => 'answer', 'schema' => fixture('schema')];
             if ($strict !== null) { $envelope['strict'] = $strict; }
-            assertSchemaPayload(requestParams(metadata(['supported_parameters' => ['structured_outputs']]), schemaConfig($envelope)), $strict ?? true, 'answer');
+            $transport = new FixtureTransport();
+            directModel(['supported_parameters' => ['structured_outputs']], schemaConfig($envelope), $transport)
+                ->generateTextResult(prompt());
+            $payload = json_decode($transport->requests[0]->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            assertSchemaPayload($payload, $strict, 'answer');
         }
+    },
+    'raw schema optional fields survive the actual JSON request' => static function (): void {
+        $schema = fixture('schema');
+        $schema['title'] = 'Answer contract';
+        $schema['description'] = 'Human-readable answer';
+        $schema['properties']['answer']['description'] = 'The concise answer';
+        $config = new ModelConfig();
+        $config->setOutputSchema($schema);
+        $transport = new FixtureTransport();
+        directModel(['supported_parameters' => ['structured_outputs']], $config, $transport)->generateTextResult(prompt());
+        $body = json_decode($transport->requests[0]->getBody(), true, 512, JSON_THROW_ON_ERROR);
+        expectSame(['name' => 'response', 'schema' => $schema], $body['response_format']['json_schema'], 'Optional schema fields retained without invented strict');
     },
     'schema merges provider preferences without weakening endpoint guard' => static function (): void {
         $config = schemaConfig();
@@ -274,7 +396,7 @@ foreach (['array-fields' => ['input_modalities' => ['text', 'image'], 'output_mo
         foreach (['application/pdf', 'video/mp4', 'audio/wav'] as $mime) {
             $messages = [new Message(MessageRoleEnum::user(), [new MessagePart('media'), new MessagePart(new File('https://fixtures.invalid/media', $mime))])];
             expectSame(false, ModelRequirements::fromPromptData(CapabilityEnum::textGeneration(), $messages, new ModelConfig())->areMetBy($metadata), 'Unsafe input denied');
-            rejectBeforeTransport(['architecture' => $architecture], new ModelConfig(), 'does not support', $messages);
+            rejectBeforeTransport(['architecture' => $architecture], new ModelConfig(), 'Unsupported MIME type', $messages);
         }
         expectSame(false, in_array(CapabilityEnum::imageGeneration(), $metadata->getSupportedCapabilities(), true), 'No image generation advertised');
         $config = new ModelConfig();
@@ -282,7 +404,7 @@ foreach (['array-fields' => ['input_modalities' => ['text', 'image'], 'output_mo
         expectSame(true, isSelected($metadata, $config), 'Plain text output allowed');
         $config->setOutputModalities([ModalityEnum::text(), ModalityEnum::image()]);
         expectSame(false, isSelected($metadata, $config), 'Mixed output not advertised');
-        rejectBeforeTransport(['architecture' => $architecture], $config, 'does not support');
+        rejectBeforeTransport(['architecture' => $architecture], $config, 'non-text output modality');
     };
 }
 $tests['dual output metadata preserves text and adds separate image-only output'] = static function (): void {
@@ -293,7 +415,7 @@ $tests['dual output metadata preserves text and adds separate image-only output'
     $config = new ModelConfig();
     $config->setOutputModalities([ModalityEnum::image()]);
     expectSame(true, ModelRequirements::fromPromptData(CapabilityEnum::imageGeneration(), prompt(), $config)->areMetBy($model), 'Image-only SDK output selected');
-    rejectBeforeTransport($extra, $config, 'text output modality');
+    rejectBeforeTransport($extra, $config, 'non-text output modality');
     $config->setOutputModalities([ModalityEnum::text(), ModalityEnum::image()]);
     expectSame(false, isSelected($model, $config), 'Mixed output stays unsupported');
 };
@@ -303,6 +425,58 @@ $tests['explicit supported provider requirement and schema description preserved
     $payload = requestParams(metadata(['supported_parameters' => ['structured_outputs']]), $config);
     expectSame('Answer envelope', $payload['response_format']['json_schema']['description'], 'Description retained');
     expectSame(['require_parameters' => true, 'only' => ['FixtureEndpoint']], $payload['provider'], 'Explicit true and preferences retained');
+};
+$tests['ordinary direct SDK options and safe custom passthrough reach transport'] = static function (): void {
+    $config = new ModelConfig();
+    $config->setCandidateCount(2);
+    $config->setCustomOptions([
+        'seed' => 42,
+        'tools' => [['type' => 'function', 'function' => declaration()->toArray()]],
+        'response_format' => ['type' => 'json_object'],
+        'modalities' => ['text'],
+        'stream' => false,
+    ]);
+    $transport = new FixtureTransport();
+    directModel(['supported_parameters' => ['tools', 'response_format']], $config, $transport)->generateTextResult(prompt());
+    $payload = $transport->requests[0]->getData();
+    expectSame(2, $payload['n'], 'Inherited candidate count retained');
+    expectSame(42, $payload['seed'], 'Legacy custom option retained');
+    expectSame('lookup', $payload['tools'][0]['function']['name'], 'Raw function tools retained');
+    expectSame(['type' => 'json_object'], $payload['response_format'], 'JSON object passthrough retained');
+    expectSame(['text'], $payload['modalities'], 'Text-only modality retained');
+    expectSame(false, $payload['stream'], 'Non-streaming legacy flag retained');
+};
+$tests['direct inline audio keeps the inherited SDK serializer without discovery advertising'] = static function (): void {
+    $messages = [new Message(MessageRoleEnum::user(), [
+        new MessagePart('transcribe'),
+        new MessagePart(new File('data:audio/wav;base64,UklGRg==', 'audio/wav')),
+    ])];
+    $metadata = metadata();
+    expectSame(false, ModelRequirements::fromPromptData(CapabilityEnum::textGeneration(), $messages, new ModelConfig())->areMetBy($metadata), 'Audio input is not advertised for discovery');
+    $transport = new FixtureTransport();
+    directModel([], new ModelConfig(), $transport)->generateTextResult($messages);
+    $content = $transport->requests[0]->getData()['messages'][0]['content'];
+    expectSame('input_audio', $content[1]['type'], 'Inherited inline audio serializer reached transport');
+    expectSame('UklGRg==', $content[1]['input_audio']['data'], 'Audio bytes retained');
+};
+$tests['unsupported raw advanced contracts and unsafe output forms fail before transport'] = static function (): void {
+    foreach ([
+        ['tools' => [['type' => 'function', 'function' => declaration()->toArray()]]],
+        ['response_format' => ['type' => 'json_object']],
+        ['response_format' => ['type' => 'json_schema', 'json_schema' => ['name' => 'x', 'schema' => fixture('schema')]]],
+        ['modalities' => ['text', 'image']],
+        ['stream' => true],
+    ] as $custom) {
+        $config = new ModelConfig();
+        $config->setCustomOptions($custom);
+        rejectBeforeTransport([], $config, (string) array_key_first($custom));
+    }
+};
+$tests['typed tools cannot be replaced by raw custom tools'] = static function (): void {
+    $config = new ModelConfig();
+    $config->setFunctionDeclarations([declaration()]);
+    $config->setCustomOptions(['tools' => [['type' => 'function', 'function' => declaration()->toArray()]]]);
+    rejectBeforeTransport(['supported_parameters' => ['tools']], $config, 'tools');
 };
 $tests['schema provider list or null rejected before transport'] = static function (): void {
     foreach ([null, ['not-an-object']] as $value) {

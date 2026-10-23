@@ -22,6 +22,7 @@ use WordPress\AiClient\Providers\Http\DTO\RequestOptions;
 use WordPress\AiClient\Providers\Http\DTO\Response;
 use WordPress\AiClient\Providers\Http\Exception\ResponseException;
 use WordPress\AiClient\Providers\Models\DTO\ModelConfig;
+use WordPress\AiClient\Providers\Models\DTO\ModelMetadata;
 use WordPress\AiClient\Providers\Models\DTO\ModelRequirements;
 use WordPress\AiClient\Providers\Models\Enums\CapabilityEnum;
 use WordPress\AiClient\Providers\ProviderRegistry;
@@ -36,7 +37,14 @@ require __DIR__ . '/harness.php';
 
 function imageFixture(string $name): array
 {
-    return json_decode(file_get_contents(__DIR__ . '/fixtures/' . $name . '.json'), true, 512, JSON_THROW_ON_ERROR);
+    $data = json_decode(file_get_contents(__DIR__ . '/fixtures/' . $name . '.json'), true, 512, JSON_THROW_ON_ERROR);
+    if ($name === 'image-response') {
+        // The shared fixture includes SVG; successful image-route examples use
+        // raster bytes while a separate rejection test exercises that SVG URI.
+        $data['choices'][0]['message']['images'][1]['image_url']['url'] =
+            $data['choices'][0]['message']['images'][0]['image_url']['url'];
+    }
+    return $data;
 }
 
 class ImageFixtureTransport implements HttpTransporterInterface
@@ -86,9 +94,9 @@ function imageMetadata(string $id = 'fixture/dual')
     throw new RuntimeException('Unknown image fixture');
 }
 
-function directImage(ImageFixtureTransport $transport, ModelConfig $config): OpenRouterImageGenerationModel
+function directImage(ImageFixtureTransport $transport, ModelConfig $config, ?ModelMetadata $metadata = null): OpenRouterImageGenerationModel
 {
-    $model = new OpenRouterImageGenerationModel(imageMetadata(), OpenRouterProvider::metadata());
+    $model = new OpenRouterImageGenerationModel($metadata ?? imageMetadata(), OpenRouterProvider::metadata());
     $model->setConfig($config);
     $model->setHttpTransporter($transport);
     $model->setRequestAuthentication(new ApiKeyRequestAuthentication('offline-not-a-key'));
@@ -187,7 +195,7 @@ $tests = [
             $parts = $result->getCandidates()[0]->getMessage()->getParts();
             expectSame('Here are images.', $parts[0]->getText(), 'Optional text retained');
             expectSame('image/png', $parts[1]->getFile()->getMimeType(), 'PNG MIME');
-            expectSame('image/svg+xml', $parts[2]->getFile()->getMimeType(), 'SVG MIME, not PNG lie');
+            expectSame('image/png', $parts[2]->getFile()->getMimeType(), 'Second raster MIME');
             expectSame('image/webp', $result->getCandidates()[1]->getMessage()->getParts()[0]->getFile()->getMimeType(), 'Next candidate WebP');
             expectSame([10, 20, 30], [$result->getTokenUsage()->getPromptTokens(), $result->getTokenUsage()->getCompletionTokens(), $result->getTokenUsage()->getTotalTokens()], 'Usage names');
             expectSame('fixture/reported-model', $result->getAdditionalData()['model'], 'Reported model retained separately');
@@ -241,7 +249,7 @@ $tests = [
         $legacy = metadata(['architecture' => ['modality' => 'text+image->text+image']]);
         expectSame(true, ModelRequirements::fromPromptData(CapabilityEnum::imageGeneration(), prompt(), $config)->areMetBy($legacy), 'Legacy image selection');
     },
-    'optional and partial usage uses explicit unknown sentinel not fabricated zeros; nested usage survives' => static function (): void {
+    'optional and partial usage uses zero compatibility placeholder with unknown names and raw usage' => static function (): void {
         foreach ([null, [], ['prompt_tokens' => 0], ['completion_tokens_details' => ['image_tokens' => 12], 'cost' => 0.2], ['prompt_tokens' => 3, 'completion_tokens' => 4]] as $usage) {
             $response = imageFixture('image-response');
             unset($response['usage']);
@@ -250,8 +258,12 @@ $tests = [
             $transport->responses[] = imageResponse($response);
             $result = imageBuilder($transport)->generateImageResult();
             $tokens = $result->getTokenUsage();
-            expectSame([$usage['prompt_tokens'] ?? -1, $usage['completion_tokens'] ?? -1, $usage['total_tokens'] ?? -1], [$tokens->getPromptTokens(), $tokens->getCompletionTokens(), $tokens->getTotalTokens()], 'Unknown is -1, not zero or inferred sum');
+            expectSame([$usage['prompt_tokens'] ?? 0, $usage['completion_tokens'] ?? 0, $usage['total_tokens'] ?? 0], [$tokens->getPromptTokens(), $tokens->getCompletionTokens(), $tokens->getTotalTokens()], 'Zero compatibility placeholder, no inferred sum');
             expectSame($usage, $result->getAdditionalData()['openrouter_usage'], 'Raw optional/nested usage');
+            $unknown = array_values(array_filter(['prompt_tokens', 'completion_tokens', 'total_tokens'], static function (string $name) use ($usage): bool {
+                return !isset($usage[$name]);
+            }));
+            expectSame($unknown, $result->getAdditionalData()['openrouter_unknown_token_counts'], 'Unknown names distinguish missing from genuine zero');
         }
     },
     'allowlisted routing/user custom options and empty system instruction preserved' => static function (): void {
@@ -265,6 +277,32 @@ $tests = [
         expectSame('', $data['messages'][0]['content'][0]['text'], 'Empty system not silently dropped');
         expectSame($custom['provider'], $data['provider'], 'Routing retained');
         expectSame('offline-user', $data['user'], 'User retained');
+    },
+    'documented image_config aspect ratio passes through normal SDK builder and encoded request' => static function (): void {
+        $transport = new ImageFixtureTransport();
+        $config = new ModelConfig();
+        $config->setCustomOptions(['image_config' => ['aspect_ratio' => '16:9']]);
+        $config->setOutputModalities([ModalityEnum::image()]);
+        $result = imageBuilder($transport)->usingModelConfig($config)->generateImageResult();
+        expectSame('image-result-fixture', $result->getId(), 'Response still parsed');
+        $request = $transport->generations()[0];
+        $wire = json_decode($request->getBody(), true, 512, JSON_THROW_ON_ERROR);
+        expectSame(['aspect_ratio' => '16:9'], $wire['image_config'], 'Nested documented option encoded without flattening');
+        expectSame(['text', 'image'], $wire['modalities'], 'Image route remains selected');
+    },
+    'serialized metadata and output enum retain image request selection and wire modalities' => static function (): void {
+        foreach (['fixture/dual' => ['text', 'image'], 'fixture/image-only' => ['image']] as $id => $modalities) {
+            $transport = new ImageFixtureTransport();
+            $config = new ModelConfig();
+            $config->setOutputModalities([ModalityEnum::image()]);
+            $restoredConfig = unserialize(serialize($config));
+            $restoredMetadata = unserialize(serialize(imageMetadata($id)));
+            expectSame(false, $restoredConfig->getOutputModalities()[0] === ModalityEnum::image(), 'Fixture reproduces detached enum identity');
+            $model = directImage($transport, $restoredConfig, $restoredMetadata);
+            $result = $model->generateImageResult(prompt());
+            expectSame($id, $result->getModelMetadata()->getId(), 'Serialized metadata retained');
+            expectSame($modalities, $transport->generations()[0]->getData()['modalities'], 'Capabilities compared by value');
+        }
     },
 ];
 
@@ -312,7 +350,7 @@ foreach (['fixture/dual' => ['text', 'image'], 'fixture/image-only' => ['image']
                         expectSame('file', $part->getType()->value, 'Only files, no function execution payload');
                         $uri = $data['choices'][$index]['message']['images'][$imageIndex]['image_url']['url'];
                         expectSame($uri, $part->getFile()->getDataUri(), 'Image bytes and order retained');
-                        expectSame($index === 0 && $imageIndex === 1 ? 'image/svg+xml' : 'image/png', $part->getFile()->getMimeType(), 'Declared MIME retained');
+                        expectSame('image/png', $part->getFile()->getMimeType(), 'Raster MIME retained');
                     }
                 }
                 expectSame([10, 20, 30], [$result->getTokenUsage()->getPromptTokens(), $result->getTokenUsage()->getCompletionTokens(), $result->getTokenUsage()->getTotalTokens()], 'Usage unchanged');
@@ -352,7 +390,7 @@ foreach ($optionalFields as $key) {
     }
 }
 
-foreach (['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/svg+xml', 'IMAGE/PNG'] as $mime) {
+foreach (['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'IMAGE/PNG'] as $mime) {
     $tests['supported result MIME preserved ' . $mime] = static function () use ($mime): void {
         $data = imageFixture('image-response');
         $data['choices'] = [$data['choices'][0]];
@@ -381,10 +419,19 @@ foreach ([
         imageReject($config);
     };
 }
-foreach (['model', 'models', 'messages', 'prompt', 'modalities', 'stream', 'tools', 'tool_choice', 'response_format', 'image_config', 'n', 'size', 'quality', 'aspect_ratio', 'resolution', 'output_format', 'input_references', 'audio', 'video', 'max_tokens', 'seed', 'plugins', 'unknown'] as $key) {
+foreach (['model', 'models', 'messages', 'prompt', 'modalities', 'stream', 'tools', 'tool_choice', 'response_format', 'n', 'size', 'quality', 'aspect_ratio', 'resolution', 'output_format', 'input_references', 'audio', 'video', 'max_tokens', 'seed', 'plugins', 'unknown'] as $key) {
     $tests['custom image contract/config bypass rejected ' . $key] = static function () use ($key): void {
         $config = new ModelConfig();
         $config->setCustomOptions([$key => null]);
+        imageReject($config);
+    };
+}
+foreach ([null, [], '16:9', ['aspect_ratio' => ''], ['aspect_ratio' => 16],
+    ['aspect_ratio' => '100:1'], ['aspect_ratio' => '16:9', 'quality' => 'high'],
+    ['quality' => 'high'], ['aspect_ratio' => ['16:9']]] as $index => $imageConfig) {
+    $tests['malformed or unsupported image_config rejected locally ' . $index] = static function () use ($imageConfig): void {
+        $config = new ModelConfig();
+        $config->setCustomOptions(['image_config' => $imageConfig]);
         imageReject($config);
     };
 }
@@ -428,6 +475,34 @@ foreach (['data:image/png;base64,', 'data:image/png;base64,%%%=', 'data:image/pn
     $tests['malformed or unsupported result URI controlled error ' . $uri] = static function () use ($uri): void {
         $data = imageFixture('image-response');
         $data['choices'][0]['message']['images'][0]['image_url']['url'] = $uri;
+        imageResponseReject(imageResponse($data));
+    };
+}
+$tests['generated SVG is rejected until a sanitization contract exists'] = static function (): void {
+    $data = imageFixture('image-response');
+    $data['choices'][0]['message']['images'][0]['image_url']['url'] =
+        'data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9ImFsZXJ0KDEpIi8+';
+    imageResponseReject(imageResponse($data));
+};
+foreach (['absent', 'null', 'length', 'content_filter'] as $finish) {
+    $tests['valid parsed images preserve completion finish ' . $finish] = static function () use ($finish): void {
+        $data = imageFixture('image-response');
+        $data['choices'] = [$data['choices'][0]];
+        if ($finish === 'absent') {
+            unset($data['choices'][0]['finish_reason']);
+        } else {
+            $data['choices'][0]['finish_reason'] = $finish === 'null' ? null : $finish;
+        }
+        $transport = new ImageFixtureTransport();
+        $transport->responses[] = imageResponse($data);
+        $reason = imageBuilder($transport)->generateImageResult()->getCandidates()[0]->getFinishReason()->value;
+        expectSame($finish === 'absent' || $finish === 'null' ? 'stop' : $finish, $reason, 'Only missing/null defaults to stop');
+    };
+}
+foreach (['error', 'unknown', 'tool_calls', 0, false, ''] as $finish) {
+    $tests['unsupported image finish remains explicit error ' . var_export($finish, true)] = static function () use ($finish): void {
+        $data = imageFixture('image-response');
+        $data['choices'][0]['finish_reason'] = $finish;
         imageResponseReject(imageResponse($data));
     };
 }
