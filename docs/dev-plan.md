@@ -28,8 +28,8 @@ Independent QA: GPT-6 Sol Medium. Supervisor owns this plan and Git operations.
 
 | Task | Scope | Developer | QA | Status | Repairs | Evidence | Commit |
 |---|---|---|---|---|---|---|---|
-| T1 | Explicit modality return shape; preserve behavior | Luna High (`modality_fix`) | Sol Medium (`independent_qa`) | validating | 0 | Independent QA PASS; 203/203 on PHP 8.4.6 and 7.4.30; PHPStan max clean | Awaiting validated commit |
-| T2 | Full baseline, static and WordPress/live validation | Supervisor | Sol Medium reviews T1 and coverage | validating | 0 | 203/203 per PHP runtime; 28 WP cases; 8/8 live; syntax/PSR-12/PHPStan pass | Awaiting validated commit |
+| T1 | Explicit modality return shape; preserve behavior | Luna High (`modality_fix`) | Sol Medium (`independent_qa`) | done | 0 | Independent QA PASS; 203/203 on PHP 8.4.6 and 7.4.30; PHPStan max clean | 105f5c9 |
+| T2 | Full baseline, static and WordPress/live validation | Supervisor | Sol Medium reviews T1 and coverage | done | 0 | 203/203 per PHP runtime; 28 WP cases; 8/8 live; syntax/PSR-12/PHPStan pass | 105f5c9 |
 
 T2 depends on the frozen T1 implementation. No parallel implementation edits.
 Workers may not edit this tracker, commit, push, or delegate further.
@@ -72,8 +72,9 @@ previous `/models` snapshot. No live completeness claim covers those paths.
 
 - Preparation: clean isolated checkout switched to the existing fork PR branch.
   Fork is `origin`; upstream push URL is disabled locally.
-- Next: T1 implementation, independent QA, full validation, scoped commits,
-  then push only the authorized fork branch.
+- Complete: implementation commit `105f5c9f7a9f09c1b39d5b293b1b882650902d6d`
+  passed independent source QA and evidence audit. All scoped validation passed.
+  Final plan checkpoint precedes the fork-only push; no active workers or wakeups.
 
 ## Validation results — 2026-10-23
 
@@ -102,3 +103,9 @@ previous `/models` snapshot. No live completeness claim covers those paths.
 Full repository deployment/Props Bot workflows were not run; root development
 Composer/default PHPCS debt remains unchanged. The complete available contract
 suite and the explicit integration matrix above were rerun after the source fix.
+
+Independent evidence audit also passed: eight one-request cases, exact approved
+model IDs, cost total, strict combined schema payload, reference/history fields,
+and saved PNG hashes match the records. Raw response bodies/network traces were
+not retained, so QA is an audit of the saved evidence and harness rather than a
+separate paid replay. No Codex usage budget was requested after Brad waived it.
